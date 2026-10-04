@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ganado · Mapa en vivo</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <style>
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; font-family: system-ui, sans-serif; }
+    body { display: flex; }
+    #panel {
+      width: 280px; flex-shrink: 0; padding: 12px; overflow-y: auto;
+      border-right: 1px solid #ddd; background: #fafafa;
+    }
+    #panel h1 { font-size: 18px; margin: 0 0 4px; }
+    #status { font-size: 12px; color: #666; margin-bottom: 10px; }
+    #status.error { color: #b91c1c; }
+    #clearTrack { display: none; width: 100%; margin-bottom: 10px; padding: 6px; cursor: pointer; }
+    #list { list-style: none; margin: 0; padding: 0; }
+    #list li {
+      display: flex; align-items: center; gap: 8px; padding: 8px 6px;
+      border-bottom: 1px solid #eee; cursor: pointer; font-size: 14px;
+    }
+    #list li:hover { background: #f0f0f0; }
+    .dot { width: 12px; height: 12px; border-radius: 50%; flex-shrink: 0; }
+    .meta { font-size: 12px; color: #666; }
+    #map { flex: 1; }
+    .legend { font-size: 11px; color: #666; margin-top: 14px; line-height: 1.6; }
+    @media (max-width: 700px) {
+      body { flex-direction: column-reverse; }
+      #panel { width: 100%; height: 35%; border-right: 0; border-top: 1px solid #ddd; }
+      #map { height: 65%; flex: none; }
+    }
+  </style>
+</head>
+<body>
+  <aside id="panel">
+    <h1>Ganado</h1>
+    <div id="status">Cargando…</div>
+    <button id="clearTrack">Quitar recorrido</button>
+    <ul id="list"></ul>
+    <div class="legend">
+      <span style="color:#4607e5">●</span> batería &ge; 50 %<br>
+      <span style="color:#f59e0b">●</span> batería 20–49 %<br>
+      <span style="color:#dc2626">●</span> batería &lt; 20 %<br>
+      <span style="color:#6b7280">●</span> sin señal hace más de 30 min
+    </div>
+  </aside>
+  <div id="map"></div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const REFRESH_MS = 10000;   // cada cuánto se actualiza el mapa
+    const STALE_MIN = 30;       // minutos sin reportar para marcar "sin señal"
+
+    // Vista inicial; se reajusta sola a las vacas cuando llegan los datos.
+    const map = L.map('map').setView([3.982274947576973, -73.78320435338192], 15);
+
+    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19,
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+    }).addTo(map);
+
+    const coordenadas = [
+      [3.9860672136958475, -73.78246698491962],
+      [3.9825224736074203, -73.786422215502],
+      [3.98130950552477, -73.785268070323],
+      [3.979720197794364, -73.78211211427006],
+      [3.980371057512912, -73.78120174233133]
+    ];
+
+    var limiteFinca = L.polygon(coordenadas, {
+      color: 'red',
+      fillOpacity: 0.0,
+      weight: 1
+    }).addTo(map)
+
+    limiteFinca.bindPopup("<b>Propiedad:</b> Finca Pa Pisar Cabeza")
+
+    const markers = new Map();   // animal_id -> marcador
+    let trackLayer = null;
+    let firstLoad = true;
+
+    const statusEl = document.getElementById('status');
+    const listEl = document.getElementById('list');
+    const clearBtn = document.getElementById('clearTrack');
+
+    function ageMinutes(iso) {
+      return (Date.now() - new Date(iso).getTime()) / 60000;
+    }
+
+    function timeAgo(iso) {
+      const m = Math.round(ageMinutes(iso));
+      if (m < 1) return 'hace instantes';
+      if (m < 60) return `hace ${m} min`;
+      const h = Math.floor(m / 60);
+      if (h < 24) return `hace ${h} h`;
+      return `hace ${Math.floor(h / 24)} d`;
+    }
+
+    function colorFor(p) {
+      if (ageMinutes(p.recorded_at) > STALE_MIN) return '#6b7280';
+      if (p.battery == null) return '#2563eb';
+      if (p.battery < 20) return '#dc2626';
+      if (p.battery < 50) return '#f59e0b';
+      return '#440ee1';
+    }
+
+    // Los textos (como el nombre de la vaca) vienen de la base de datos.
+    // Se insertan con textContent y no con innerHTML para evitar inyección de HTML.
+    function popupContent(p) {
+      const box = document.createElement('div');
+      const title = document.createElement('strong');
+      title.textContent = p.tag;
+      const info = document.createElement('div');
+      info.textContent = `Batería: ${p.battery ?? '?'} % · ${timeAgo(p.recorded_at)}`;
+      const btn = document.createElement('button');
+      btn.textContent = 'Ver recorrido (24 h)';
+      btn.style.marginTop = '6px';
+      btn.onclick = () => showTrack(p.animal_id);
+      box.append(title, info, btn);
+      return box;
+    }
+
+    function renderList(features) {
+      listEl.replaceChildren();
+      for (const f of features) {
+        const p = f.properties;
+        const li = document.createElement('li');
+
+        const dot = document.createElement('span');
+        dot.className = 'dot';
+        dot.style.background = colorFor(p);
+
+        const text = document.createElement('div');
+        const name = document.createElement('div');
+        name.textContent = p.tag;
+        const meta = document.createElement('div');
+        meta.className = 'meta';
+        meta.textContent = `${p.battery ?? '?'} % · ${timeAgo(p.recorded_at)}`;
+        text.append(name, meta);
+
+        li.append(dot, text);
+        li.onclick = () => {
+          const m = markers.get(p.animal_id);
+          if (m) { map.setView(m.getLatLng(), Math.max(map.getZoom(), 17)); m.openPopup(); }
+        };
+        listEl.appendChild(li);
+      }
+    }
+
+    async function refresh() {
+      try {
+        const res = await fetch('/v1/positions/live', { cache: 'no-store' });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+
+        const bounds = [];
+        for (const f of data.features) {
+          const p = f.properties;
+          const [lon, lat] = f.geometry.coordinates;   // GeoJSON: [lon, lat]
+          bounds.push([lat, lon]);
+
+          let m = markers.get(p.animal_id);
+          if (!m) {
+            m = L.circleMarker([lat, lon], { radius: 9, weight: 2, color: '#fff', fillOpacity: 0.95 }).addTo(map);
+            m.bindPopup(popupContent(p));
+            markers.set(p.animal_id, m);
+          } else {
+            m.setLatLng([lat, lon]);
+            m.setPopupContent(popupContent(p));
+          }
+          m.setStyle({ fillColor: colorFor(p) });
+        }
+
+        renderList(data.features);
+
+        if (firstLoad && bounds.length) {
+          map.fitBounds(bounds, { padding: [40, 40], maxZoom: 17 });
+          firstLoad = false;
+        }
+
+        statusEl.className = '';
+        statusEl.textContent = data.features.length
+          ? `${data.features.length} animales · actualizado ${new Date().toLocaleTimeString()}`
+          : 'Aún no hay datos de ningún animal';
+      } catch (err) {
+        statusEl.className = 'error';
+        statusEl.textContent = 'Error al cargar datos: ' + err.message;
+      }
+    }
+
+    async function showTrack(animalId) {
+      const to = new Date();
+      const from = new Date(to.getTime() - 24 * 3600 * 1000);
+      const url = `/v1/animals/${animalId}/track?from=${encodeURIComponent(from.toISOString())}` +
+                  `&to=${encodeURIComponent(to.toISOString())}&limit=5000`;
+      try {
+        const res = await fetch(url);
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+        const latlngs = data.points.map(p => [p.lat, p.lon]);
+        if (latlngs.length < 2) { alert('No hay suficientes puntos en las últimas 24 horas.'); return; }
+
+        clearTrack();
+        trackLayer = L.polyline(latlngs, { color: '#2563eb', weight: 3, opacity: 0.8 }).addTo(map);
+        map.fitBounds(trackLayer.getBounds(), { padding: [40, 40] });
+        clearBtn.style.display = 'block';
+      } catch (err) {
+        alert('No se pudo cargar el recorrido: ' + err.message);
+      }
+    }
+
+    function clearTrack() {
+      if (trackLayer) { map.removeLayer(trackLayer); trackLayer = null; }
+      clearBtn.style.display = 'none';
+    }
+    clearBtn.onclick = clearTrack;
+
+    refresh();
+    setInterval(refresh, REFRESH_MS);
+  </script>
+</body>
+</html>

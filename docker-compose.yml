@@ -1,0 +1,49 @@
+services:
+  db:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_USER: bulltagadmin
+      POSTGRES_PASSWORD: bulltagdev
+      POSTGRES_DB: bulltagdb
+    ports:
+      - "127.0.0.1:5432:5432" # solo accesible desde tu máquina
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Se ejecuta SOLO la primera vez que se crea el volumen.
+      # Se monta el archivo suelto (no la carpeta) para no pisar los
+      # scripts de inicialización que ya trae la imagen de PostGIS.
+      - ./migrations/001_init.sql:/docker-entrypoint-initdb.d/20_init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bulltagadmin -d bulltagdb"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  ingest:
+    build: .
+    environment:
+      DATABASE_URL: postgres://bulltagadmin:bulltagdev@db:5432/bulltagdb?sslmode=disable
+      INGEST_TOKEN: f8b2047591457e6539681eb1c45d3b4d15365ed2134dc20513c8ef92eb9592d5
+    ports:
+      - "8080:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # Simulador de vacas (no arranca solo). Se ejecuta con:
+  #   docker compose run --rm simulator
+  simulator:
+    build: .
+    entrypoint: ["/simulator"]
+    profiles: ["tools"]
+    environment:
+      INGEST_URL: http://ingest:8080/v1/ingest/chirpstack?event=up
+      INGEST_TOKEN: f8b2047591457e6539681eb1c45d3b4d15365ed2134dc20513c8ef92eb9592d5
+      COWS: "5"          # cantidad de vacas simuladas
+      INTERVAL: 10s       # cada cuánto envía cada vaca
+      BACKFILL_POINTS: "60"  # minutos de historial a generar al iniciar
+    depends_on:
+      - ingest
+
+volumes:
+  pgdata:
